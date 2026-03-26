@@ -125,7 +125,9 @@
          (/ (time-nanosecond t) 1000000000.0))))
 
   (define (sleep-seconds n)
-    (sleep (make-time 'time-duration 0 n)))
+    (let ([secs (exact (floor n))]
+          [nsecs (exact (floor (* (- n (floor n)) 1000000000)))])
+      (sleep (make-time 'time-duration nsecs secs))))
 
   ;; ---- SSM Execution ----
 
