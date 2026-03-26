@@ -78,6 +78,8 @@
   ;; SSM
   (jerboa-aws ssm api)
   (jerboa-aws ssm operations)
+  ;; PSSM (parallel SSM)
+  (jerboa-aws pssm)
   ;; Compute Optimizer
   (jerboa-aws compute-optimizer api)
   (jerboa-aws compute-optimizer operations)

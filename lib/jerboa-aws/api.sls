@@ -88,8 +88,11 @@
                    (aws-client-secret-key client)
                    ts ds)]
            [all-headers (cons (cons "Authorization" auth) headers)]
+           ;; Convert (name . value) pairs to (name :: value) for chez-https
+           [https-headers (map (lambda (h) (list (car h) ':: (cdr h)))
+                               all-headers)]
            [url (string-append "https://" host "/")]
-           [req (http-post url 'headers: all-headers 'data: body-str)]
+           [req (http-post url 'headers: https-headers 'data: body-str)]
            [status (request-status req)])
       (if (and (>= status 200) (< status 300))
         (let ([body (request-text req)])

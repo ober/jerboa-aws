@@ -93,18 +93,21 @@
                      (s3-client-secret-key client)
                      ts ds)]
              [all-headers (cons (cons "Authorization" auth) headers)]
+             ;; Convert (name . value) pairs to (name :: value) for chez-https
+             [https-headers (map (lambda (h) (list (car h) ':: (cdr h)))
+                                  all-headers)]
              [url (string-append "https://" host path)])
         (cond
           [(string=? verb "GET")
-           (http-get url 'headers: all-headers)]
+           (http-get url 'headers: https-headers)]
           [(string=? verb "PUT")
-           (http-put url 'headers: all-headers 'data: (or body ""))]
+           (http-put url 'headers: https-headers 'data: (or body ""))]
           [(string=? verb "DELETE")
-           (http-delete url 'headers: all-headers)]
+           (http-delete url 'headers: https-headers)]
           [(string=? verb "HEAD")
-           (http-head url 'headers: all-headers)]
+           (http-head url 'headers: https-headers)]
           [(string=? verb "POST")
-           (http-post url 'headers: all-headers 'data: (or body ""))]
+           (http-post url 'headers: https-headers 'data: (or body ""))]
           [else (error 's3-request "unsupported verb" verb)]))))
 
   ;; S3 request returning parsed XML hash

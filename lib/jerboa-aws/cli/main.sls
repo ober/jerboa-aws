@@ -30,7 +30,10 @@
           (jerboa-aws iam groups)
           (jerboa-aws iam roles)
           (jerboa-aws iam policies)
-          (jerboa-aws iam access-keys))
+          (jerboa-aws iam access-keys)
+          ;; SSM
+          (jerboa-aws ssm api)
+          (jerboa-aws ssm operations))
 
   ;; ---- Keyword argument helpers ----
 
@@ -138,6 +141,12 @@
         (if profile (list 'profile: profile) '())
         (if region  (list 'region: region)  '()))))
 
+  (define (make-ssm-client profile region)
+    (apply SSMClient
+      (append
+        (if profile (list 'profile: profile) '())
+        (if region  (list 'region: region)  '()))))
+
   ;; ---- Output helper ----
 
   (define (output-result result output-fmt)
@@ -155,6 +164,7 @@ Services:
   s3           S3 buckets and objects
   sts          STS identity and session operations
   iam          IAM users, groups, roles, policies
+  ssm          Systems Manager parameters and commands
 
 Global options:
   --profile, -p NAME     AWS profile name
@@ -541,6 +551,77 @@ Run 'jerboa-aws <service> help' for service-specific commands.
          (display (format "Unknown iam action: ~a\nRun 'jerboa-aws iam help' for available commands.\n" action))
          (exit 1)))))
 
+  ;; ---- SSM subcommands ----
+
+  (define (ssm-dispatch action args profile region output-fmt)
+    (let ((client (make-ssm-client profile region)))
+      (cond
+        ((string=? action "put-parameter")
+         (let ((name (or (get-opt args "--name")
+                         (error 'ssm "put-parameter requires --name")))
+               (value (or (get-opt args "--value")
+                          (error 'ssm "put-parameter requires --value")))
+               (type (or (get-opt args "--type") "String"))
+               (overwrite (get-flag args "--overwrite")))
+           (output-result
+             (put-parameter client name value 'type: type 'overwrite: overwrite)
+             output-fmt)))
+        ((string=? action "get-parameter")
+         (let ((name (or (get-opt args "--name")
+                         (error 'ssm "get-parameter requires --name")))
+               (decrypt (get-flag args "--with-decryption")))
+           (output-result
+             (get-parameter client name 'with-decryption: decrypt)
+             output-fmt)))
+        ((string=? action "get-parameters")
+         (let ((names (parse-csv (or (get-opt args "--names") "")))
+               (decrypt (get-flag args "--with-decryption")))
+           (output-result
+             (get-parameters client names 'with-decryption: decrypt)
+             output-fmt)))
+        ((string=? action "delete-parameter")
+         (let ((name (or (get-opt args "--name")
+                         (error 'ssm "delete-parameter requires --name"))))
+           (output-result (delete-parameter client name) output-fmt)))
+        ((string=? action "describe-instance-information")
+         (output-result (describe-instance-information client) output-fmt))
+        ((string=? action "send-command")
+         (let ((ids (parse-csv (or (get-opt args "--instance-ids")
+                                    (error 'ssm "send-command requires --instance-ids"))))
+               (command (or (get-opt args "--command")
+                            (error 'ssm "send-command requires --command")))
+               (doc (or (get-opt args "--document-name") "AWS-RunShellScript"))
+               (comment (get-opt args "--comment")))
+           (output-result
+             (send-command client ids command
+               'document-name: doc
+               'comment: comment)
+             output-fmt)))
+        ((string=? action "get-command-invocation")
+         (let ((cmd-id (or (get-opt args "--command-id")
+                           (error 'ssm "get-command-invocation requires --command-id")))
+               (inst-id (or (get-opt args "--instance-id")
+                            (error 'ssm "get-command-invocation requires --instance-id"))))
+           (output-result
+             (get-command-invocation client cmd-id inst-id)
+             output-fmt)))
+        ((or (string=? action "help") (string=? action "--help"))
+         (display "jerboa-aws ssm commands:
+  put-parameter                --name NAME --value VALUE [--type TYPE] [--overwrite]
+  get-parameter                --name NAME [--with-decryption]
+  get-parameters               --names NAME1,NAME2 [--with-decryption]
+  delete-parameter             --name NAME
+  describe-instance-information
+  send-command                 --instance-ids IDS --command CMD [--document-name DOC] [--comment TEXT]
+  get-command-invocation       --command-id ID --instance-id ID
+
+For parallel SSM execution, use the 'pssm' command instead.
+")
+         (exit 0))
+        (else
+         (display (format "Unknown ssm action: ~a\nRun 'jerboa-aws ssm help' for available commands.\n" action))
+         (exit 1)))))
+
   ;; ---- Main entry point ----
 
   (define (main . args)
@@ -565,6 +646,7 @@ Run 'jerboa-aws <service> help' for service-specific commands.
             ((string=? service "s3")  (s3-dispatch "help" '() profile region output-fmt))
             ((string=? service "sts") (sts-dispatch "help" '() profile region output-fmt))
             ((string=? service "iam") (iam-dispatch "help" '() profile region output-fmt))
+            ((string=? service "ssm") (ssm-dispatch "help" '() profile region output-fmt))
             (else (print-usage))))
 
         (let ((action (car rest))
@@ -578,9 +660,11 @@ Run 'jerboa-aws <service> help' for service-specific commands.
              (sts-dispatch action action-args profile region output-fmt))
             ((string=? service "iam")
              (iam-dispatch action action-args profile region output-fmt))
+            ((string=? service "ssm")
+             (ssm-dispatch action action-args profile region output-fmt))
             ;; Future services -- placeholder dispatchers
             ((member service '("lambda" "dynamodb" "logs" "sns" "sqs"
-                               "cfn" "cloudwatch" "rds" "elbv2" "ssm"))
+                               "cfn" "cloudwatch" "rds" "elbv2"))
              (display (format "Service '~a' is not yet implemented.\n" service))
              (exit 1))
             (else

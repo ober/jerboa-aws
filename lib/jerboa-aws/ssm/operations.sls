@@ -3,7 +3,8 @@
 
 (library (jerboa-aws ssm operations)
   (export put-parameter get-parameter get-parameters
-          delete-parameter describe-instance-information)
+          delete-parameter describe-instance-information
+          send-command get-command-invocation)
   (import (chezscheme)
           (jerboa-aws ssm api))
 
@@ -55,6 +56,24 @@
         (when next-token
           (hashtable-set! payload "NextToken" next-token))
         (ssm-action client "DescribeInstanceInformation" payload))))
+
+  (define (send-command client instance-ids command . args)
+    (let ([document-name (kw-ref args 'document-name: "AWS-RunShellScript")]
+          [comment (kw-ref args 'comment: #f)])
+      (let ([payload (make-hashtable string-hash string=?)])
+        (hashtable-set! payload "DocumentName" document-name)
+        (hashtable-set! payload "InstanceIds" (list->vector instance-ids))
+        (let ([params (make-hashtable string-hash string=?)])
+          (hashtable-set! params "commands" (vector command))
+          (hashtable-set! payload "Parameters" params))
+        (when comment (hashtable-set! payload "Comment" comment))
+        (ssm-action client "SendCommand" payload))))
+
+  (define (get-command-invocation client command-id instance-id)
+    (let ([payload (make-hashtable string-hash string=?)])
+      (hashtable-set! payload "CommandId" command-id)
+      (hashtable-set! payload "InstanceId" instance-id)
+      (ssm-action client "GetCommandInvocation" payload)))
 
   ;; --- Helpers ---
   (define (kw-ref args key default)
