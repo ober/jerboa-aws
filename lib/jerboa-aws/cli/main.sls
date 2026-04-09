@@ -161,7 +161,8 @@ Usage: jerboa-aws [--profile NAME] [--region REGION] [--output FORMAT] <service>
 
 Services:
   ec2          EC2 instances, VPCs, security groups, etc.
-  s3           S3 buckets and objects
+  s3           S3 high-level (ls, cp, mv, rm, mb, rb)
+  s3api        S3 low-level API (list-buckets, get-object, etc.)
   sts          STS identity and session operations
   iam          IAM users, groups, roles, policies
   ssm          Systems Manager parameters and commands
@@ -323,32 +324,187 @@ Run 'jerboa-aws <service> help' for service-specific commands.
          (display (format "Unknown ec2 action: ~a\nRun 'jerboa-aws ec2 help' for available commands.\n" action))
          (exit 1)))))
 
-  ;; ---- S3 subcommands ----
+  ;; ---- S3 URI helpers ----
+
+  (define (s3-uri? str)
+    (and (string? str)
+         (>= (string-length str) 5)
+         (string=? (substring str 0 5) "s3://")))
+
+  ;; Parse "s3://bucket" → (cons "bucket" #f)
+  ;; Parse "s3://bucket/" → (cons "bucket" "")
+  ;; Parse "s3://bucket/key/path" → (cons "bucket" "key/path")
+  (define (parse-s3-uri uri)
+    (if (s3-uri? uri)
+      (let* ((rest (substring uri 5 (string-length uri)))
+             (slash (let loop ((i 0))
+                      (cond
+                        ((= i (string-length rest)) #f)
+                        ((char=? (string-ref rest i) #\/) i)
+                        (else (loop (+ i 1)))))))
+        (if slash
+          (cons (substring rest 0 slash)
+                (substring rest (+ slash 1) (string-length rest)))
+          (cons rest #f)))
+      (error 's3 "expected s3:// URI" uri)))
+
+  ;; ---- S3 high-level subcommands (aws-cli compatible) ----
 
   (define (s3-dispatch action args profile region output-fmt)
+    (let ((client (make-s3-client profile region)))
+      (cond
+        ;; ls [s3://BUCKET[/PREFIX]]  -- list buckets (no arg) or objects
+        ((string=? action "ls")
+         (if (null? args)
+           (output-result (list-buckets client) output-fmt)
+           (let* ((uri (car args))
+                  (parsed (parse-s3-uri uri))
+                  (bucket (car parsed))
+                  (prefix (cdr parsed)))
+             (output-result
+               (apply list-objects-v2 client bucket
+                 (if (and prefix (> (string-length prefix) 0))
+                   (list 'prefix: prefix)
+                   '()))
+               output-fmt))))
+        ;; cp <SRC> <DST>  -- copy: s3↔local or s3↔s3
+        ((string=? action "cp")
+         (when (< (length args) 2)
+           (display "usage: aws s3 cp <src> <dst> [--content-type TYPE]\n")
+           (exit 1))
+         (let ((src (car args))
+               (dst (cadr args))
+               (content-type (or (get-opt (cddr args) "--content-type")
+                                 "application/octet-stream")))
+           (cond
+             ;; s3://src → s3://dst  (server-side copy)
+             ((and (s3-uri? src) (s3-uri? dst))
+              (let* ((sp (parse-s3-uri src))
+                     (dp (parse-s3-uri dst)))
+                (copy-object client (car dp) (cdr dp)
+                  (string-append "/" (car sp) "/" (cdr sp)))
+                (display (format "copy: ~a to ~a\n" src dst))))
+             ;; s3://src → local  (download)
+             ((s3-uri? src)
+              (let* ((p (parse-s3-uri src))
+                     (data (get-object client (car p) (cdr p))))
+                (if (string=? dst "-")
+                  (display data)
+                  (begin
+                    (call-with-output-file dst
+                      (lambda (port) (display data port))
+                      'replace)
+                    (display (format "download: ~a to ~a\n" src dst))))))
+             ;; local → s3://dst  (upload)
+             ((s3-uri? dst)
+              (let* ((p (parse-s3-uri dst))
+                     (data (call-with-input-file src
+                             (lambda (port) (get-string-all port)))))
+                (put-object client (car p) (cdr p) data
+                  'content-type: content-type)
+                (display (format "upload: ~a to ~a\n" src dst))))
+             (else
+              (error 's3 "cp: at least one argument must be an s3:// URI")))))
+        ;; mv <SRC> <DST>  -- move: s3↔local or s3↔s3
+        ((string=? action "mv")
+         (when (< (length args) 2)
+           (display "usage: aws s3 mv <src> <dst>\n")
+           (exit 1))
+         (let ((src (car args))
+               (dst (cadr args)))
+           (cond
+             ;; s3://src → s3://dst  (copy + delete)
+             ((and (s3-uri? src) (s3-uri? dst))
+              (let* ((sp (parse-s3-uri src))
+                     (dp (parse-s3-uri dst)))
+                (copy-object client (car dp) (cdr dp)
+                  (string-append "/" (car sp) "/" (cdr sp)))
+                (delete-object client (car sp) (cdr sp))
+                (display (format "move: ~a to ~a\n" src dst))))
+             ;; s3://src → local  (download + delete)
+             ((s3-uri? src)
+              (let* ((p (parse-s3-uri src))
+                     (data (get-object client (car p) (cdr p))))
+                (if (string=? dst "-")
+                  (display data)
+                  (call-with-output-file dst
+                    (lambda (port) (display data port))
+                    'replace))
+                (delete-object client (car p) (cdr p))
+                (display (format "move: ~a to ~a\n" src dst))))
+             (else
+              (error 's3 "mv: at least one argument must be an s3:// URI")))))
+        ;; rm <s3://BUCKET/KEY>  -- delete object
+        ((string=? action "rm")
+         (when (null? args)
+           (display "usage: aws s3 rm <s3://bucket/key>\n")
+           (exit 1))
+         (let* ((p (parse-s3-uri (car args))))
+           (delete-object client (car p) (cdr p))
+           (display (format "delete: ~a\n" (car args)))))
+        ;; mb <s3://BUCKET>  -- make bucket
+        ((string=? action "mb")
+         (when (null? args)
+           (display "usage: aws s3 mb <s3://bucket>\n")
+           (exit 1))
+         (let* ((p (parse-s3-uri (car args))))
+           (create-bucket client (car p)
+             'region: (or region "us-east-1"))
+           (display (format "make_bucket: ~a\n" (car p)))))
+        ;; rb <s3://BUCKET>  -- remove bucket
+        ((string=? action "rb")
+         (when (null? args)
+           (display "usage: aws s3 rb <s3://bucket>\n")
+           (exit 1))
+         (let* ((p (parse-s3-uri (car args))))
+           (delete-bucket client (car p))
+           (display (format "remove_bucket: ~a\n" (car p)))))
+        ((or (string=? action "help") (string=? action "--help"))
+         (display "jerboa-aws s3 high-level commands (aws-cli compatible):
+  ls [s3://BUCKET[/PREFIX]]              list buckets or objects
+  cp <SRC> <DST> [--content-type TYPE]   copy: local↔s3 or s3↔s3
+  mv <SRC> <DST>                         move: local↔s3 or s3↔s3
+  rm <s3://BUCKET/KEY>                   delete object
+  mb <s3://BUCKET>                       make bucket
+  rb <s3://BUCKET>                       remove bucket
+
+For low-level API commands use 's3api':
+  jerboa-aws s3api list-buckets
+  jerboa-aws s3api get-object --bucket NAME --key KEY
+  jerboa-aws s3api put-object --bucket NAME --key KEY --body CONTENT
+  etc.
+")
+         (exit 0))
+        (else
+         (display (format "Unknown s3 action: ~a\nRun 'jerboa-aws s3 help' for available commands.\n" action))
+         (exit 1)))))
+
+  ;; ---- S3 low-level API subcommands (s3api, verbose names) ----
+
+  (define (s3api-dispatch action args profile region output-fmt)
     (let ((client (make-s3-client profile region)))
       (cond
         ((string=? action "list-buckets")
          (output-result (list-buckets client) output-fmt))
         ((string=? action "create-bucket")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "create-bucket requires --bucket"))))
+                           (error 's3api "create-bucket requires --bucket"))))
            (output-result (create-bucket client bucket) output-fmt)))
         ((string=? action "delete-bucket")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "delete-bucket requires --bucket"))))
+                           (error 's3api "delete-bucket requires --bucket"))))
            (output-result (delete-bucket client bucket) output-fmt)))
         ((string=? action "head-bucket")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "head-bucket requires --bucket"))))
+                           (error 's3api "head-bucket requires --bucket"))))
            (output-result (head-bucket client bucket) output-fmt)))
         ((string=? action "get-bucket-location")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "get-bucket-location requires --bucket"))))
+                           (error 's3api "get-bucket-location requires --bucket"))))
            (output-result (get-bucket-location client bucket) output-fmt)))
-        ((string=? action "list-objects")
+        ((string=? action "list-objects-v2")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "list-objects requires --bucket")))
+                           (error 's3api "list-objects-v2 requires --bucket")))
                (prefix (get-opt args "--prefix")))
            (output-result
              (apply list-objects-v2 client bucket
@@ -356,51 +512,51 @@ Run 'jerboa-aws <service> help' for service-specific commands.
              output-fmt)))
         ((string=? action "get-object")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "get-object requires --bucket")))
+                           (error 's3api "get-object requires --bucket")))
                (key (or (get-opt args "--key")
-                        (error 's3 "get-object requires --key"))))
+                        (error 's3api "get-object requires --key"))))
            (output-result (get-object client bucket key) output-fmt)))
         ((string=? action "put-object")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "put-object requires --bucket")))
+                           (error 's3api "put-object requires --bucket")))
                (key (or (get-opt args "--key")
-                        (error 's3 "put-object requires --key")))
+                        (error 's3api "put-object requires --key")))
                (body (or (get-opt args "--body")
-                         (error 's3 "put-object requires --body"))))
+                         (error 's3api "put-object requires --body"))))
            (output-result (put-object client bucket key body) output-fmt)))
         ((string=? action "delete-object")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "delete-object requires --bucket")))
+                           (error 's3api "delete-object requires --bucket")))
                (key (or (get-opt args "--key")
-                        (error 's3 "delete-object requires --key"))))
+                        (error 's3api "delete-object requires --key"))))
            (output-result (delete-object client bucket key) output-fmt)))
         ((string=? action "head-object")
          (let ((bucket (or (get-opt args "--bucket")
-                           (error 's3 "head-object requires --bucket")))
+                           (error 's3api "head-object requires --bucket")))
                (key (or (get-opt args "--key")
-                        (error 's3 "head-object requires --key"))))
+                        (error 's3api "head-object requires --key"))))
            (output-result (head-object client bucket key) output-fmt)))
         ((string=? action "copy-object")
          (let ((src-bucket (or (get-opt args "--source-bucket")
-                               (error 's3 "copy-object requires --source-bucket")))
+                               (error 's3api "copy-object requires --source-bucket")))
                (src-key (or (get-opt args "--source-key")
-                            (error 's3 "copy-object requires --source-key")))
+                            (error 's3api "copy-object requires --source-key")))
                (dst-bucket (or (get-opt args "--bucket")
-                               (error 's3 "copy-object requires --bucket")))
+                               (error 's3api "copy-object requires --bucket")))
                (dst-key (or (get-opt args "--key")
-                            (error 's3 "copy-object requires --key"))))
+                            (error 's3api "copy-object requires --key"))))
            (output-result
              (copy-object client dst-bucket dst-key
                (string-append "/" src-bucket "/" src-key))
              output-fmt)))
         ((or (string=? action "help") (string=? action "--help"))
-         (display "jerboa-aws s3 commands:
+         (display "jerboa-aws s3api commands (low-level API):
   list-buckets
   create-bucket          --bucket NAME
   delete-bucket          --bucket NAME
   head-bucket            --bucket NAME
   get-bucket-location    --bucket NAME
-  list-objects           --bucket NAME [--prefix PREFIX]
+  list-objects-v2        --bucket NAME [--prefix PREFIX]
   get-object             --bucket NAME --key KEY
   put-object             --bucket NAME --key KEY --body CONTENT
   delete-object          --bucket NAME --key KEY
@@ -409,7 +565,7 @@ Run 'jerboa-aws <service> help' for service-specific commands.
 ")
          (exit 0))
         (else
-         (display (format "Unknown s3 action: ~a\nRun 'jerboa-aws s3 help' for available commands.\n" action))
+         (display (format "Unknown s3api action: ~a\nRun 'jerboa-aws s3api help' for available commands.\n" action))
          (exit 1)))))
 
   ;; ---- STS subcommands ----
@@ -643,8 +799,9 @@ For parallel SSM execution, use the 'pssm' command instead.
         (when (null? rest)
           (cond
             ((string=? service "ec2") (ec2-dispatch "help" '() profile region output-fmt))
-            ((string=? service "s3")  (s3-dispatch "help" '() profile region output-fmt))
-            ((string=? service "sts") (sts-dispatch "help" '() profile region output-fmt))
+            ((string=? service "s3")    (s3-dispatch "help" '() profile region output-fmt))
+            ((string=? service "s3api") (s3api-dispatch "help" '() profile region output-fmt))
+            ((string=? service "sts")   (sts-dispatch "help" '() profile region output-fmt))
             ((string=? service "iam") (iam-dispatch "help" '() profile region output-fmt))
             ((string=? service "ssm") (ssm-dispatch "help" '() profile region output-fmt))
             (else (print-usage))))
@@ -667,6 +824,8 @@ For parallel SSM execution, use the 'pssm' command instead.
                                "cfn" "cloudwatch" "rds" "elbv2"))
              (display (format "Service '~a' is not yet implemented.\n" service))
              (exit 1))
+            ((string=? service "s3api")
+             (s3api-dispatch action action-args profile region output-fmt))
             (else
              (display (format "Unknown service: ~a\n" service))
              (print-usage)))))))
